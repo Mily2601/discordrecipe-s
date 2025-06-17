@@ -1,0 +1,441 @@
+import discord
+from discord.ext import commands
+import sqlite3
+import json
+from typing import List, Dict, Tuple
+import re
+import os
+import logging
+from pathlib import Path
+import signal
+import sys
+from dotenv import load_dotenv
+
+# Load environment variables
+load_dotenv()
+
+# Configuration
+BOT_TOKEN = os.getenv('BOT_TOKEN', '')
+DATA_DIR = Path(os.getenv('DATA_DIR', './data'))
+LOG_LEVEL = os.getenv('LOG_LEVEL', 'INFO')
+
+# Setup logging
+logging.basicConfig(
+    level=getattr(logging, LOG_LEVEL.upper(), logging.INFO),
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.StreamHandler(sys.stdout)
+    ]
+)
+logger = logging.getLogger('discord-recipe-bot')
+DATA_DIR.mkdir(exist_ok=True)
+DB_PATH = DATA_DIR / 'recipes.db'
+
+# Bot setup
+intents = discord.Intents.default()
+intents.message_content = True
+bot = commands.Bot(command_prefix='!', intents=intents)
+
+# Graceful shutdown handler
+def signal_handler(sig, frame):
+    logger.info('Shutting down bot...')
+    sys.exit(0)
+
+signal.signal(signal.SIGINT, signal_handler)
+signal.signal(signal.SIGTERM, signal_handler)
+
+# Database setup
+def init_db():
+    logger.info(f'Initializing database at {DB_PATH}')
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    
+    # Create recipes table
+    c.execute('''CREATE TABLE IF NOT EXISTS recipes
+                 (id INTEGER PRIMARY KEY AUTOINCREMENT,
+                  name TEXT NOT NULL,
+                  ingredients TEXT NOT NULL,
+                  instructions TEXT NOT NULL,
+                  servings INTEGER DEFAULT 4,
+                  author_id INTEGER,
+                  author_name TEXT)''')
+    
+    # Create shopping lists table for saved lists
+    c.execute('''CREATE TABLE IF NOT EXISTS shopping_lists
+                 (id INTEGER PRIMARY KEY AUTOINCREMENT,
+                  user_id INTEGER,
+                  recipes TEXT,
+                  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)''')
+    
+    conn.commit()
+    conn.close()
+    logger.info('Database initialized successfully')
+
+# Initialize database on startup
+init_db()
+
+# Helper functions
+def parse_ingredients(ingredients_text: str) -> List[Dict[str, str]]:
+    """Parse ingredients text into structured format"""
+    ingredients = []
+    lines = ingredients_text.strip().split('\n')
+    
+    for line in lines:
+        if line.strip():
+            # Try to extract quantity, unit, and item
+            # Pattern: number + optional unit + item
+            match = re.match(r'^(\d+\.?\d*)\s*([a-zA-Z]+)?\s+(.+)$', line.strip())
+            if match:
+                quantity, unit, item = match.groups()
+                ingredients.append({
+                    'quantity': float(quantity),
+                    'unit': unit or '',
+                    'item': item.strip()
+                })
+            else:
+                # If pattern doesn't match, store as is
+                ingredients.append({
+                    'quantity': 0,
+                    'unit': '',
+                    'item': line.strip()
+                })
+    
+    return ingredients
+
+def combine_ingredients(recipes_data: List[Tuple]) -> Dict[str, Dict[str, float]]:
+    """Combine ingredients from multiple recipes"""
+    shopping_list = {}
+    
+    for recipe in recipes_data:
+        ingredients = json.loads(recipe[2])  # ingredients are stored as JSON
+        servings = recipe[4]
+        
+        for ing in ingredients:
+            item = ing['item'].lower()
+            quantity = ing['quantity']
+            unit = ing['unit'].lower()
+            
+            # Create a key combining item and unit
+            key = f"{item} ({unit})" if unit else item
+            
+            if key in shopping_list:
+                shopping_list[key]['quantity'] += quantity
+            else:
+                shopping_list[key] = {
+                    'quantity': quantity,
+                    'unit': unit,
+                    'item': item
+                }
+    
+    return shopping_list
+
+# Bot commands
+@bot.event
+async def on_ready():
+    logger.info(f'{bot.user} has connected to Discord!')
+    logger.info(f'Database location: {DB_PATH}')
+    logger.info(f'Connected to {len(bot.guilds)} guilds')
+
+@bot.command(name='recipe_add', help='Add a new recipe. Usage: !recipe_add "Recipe Name" "ingredient1\ningredient2" "instructions" [servings]')
+async def add_recipe(ctx, name: str, ingredients: str, instructions: str, servings: int = 4):
+    """Add a new recipe to the database"""
+    try:
+        # Parse ingredients
+        parsed_ingredients = parse_ingredients(ingredients)
+        
+        # Store in database
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        
+        c.execute('''INSERT INTO recipes (name, ingredients, instructions, servings, author_id, author_name)
+                     VALUES (?, ?, ?, ?, ?, ?)''',
+                  (name, json.dumps(parsed_ingredients), instructions, servings, 
+                   ctx.author.id, str(ctx.author)))
+        
+        conn.commit()
+        recipe_id = c.lastrowid
+        conn.close()
+        
+        # Create embed response
+        embed = discord.Embed(
+            title="✅ Recipe Added Successfully!",
+            description=f"**{name}** has been added to the cookbook.",
+            color=discord.Color.green()
+        )
+        embed.add_field(name="Recipe ID", value=recipe_id, inline=True)
+        embed.add_field(name="Servings", value=servings, inline=True)
+        embed.set_footer(text=f"Added by {ctx.author}")
+        
+        await ctx.send(embed=embed)
+        logger.info(f"Recipe '{name}' added by {ctx.author}")
+        
+    except Exception as e:
+        logger.error(f"Error adding recipe: {str(e)}")
+        await ctx.send(f"❌ Error adding recipe: {str(e)}")
+
+@bot.command(name='recipe_search', help='Search for recipes. Usage: !recipe_search chicken')
+async def search_recipes(ctx, *, search_term: str):
+    """Search for recipes by name or ingredient"""
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    
+    # Search in both recipe names and ingredients
+    c.execute('''SELECT id, name, ingredients, servings FROM recipes 
+                 WHERE LOWER(name) LIKE ? OR LOWER(ingredients) LIKE ?''',
+              (f'%{search_term.lower()}%', f'%{search_term.lower()}%'))
+    
+    results = c.fetchall()
+    conn.close()
+    
+    if not results:
+        await ctx.send(f"No recipes found containing '{search_term}'")
+        return
+    
+    # Create embed with search results
+    embed = discord.Embed(
+        title=f"🔍 Search Results for '{search_term}'",
+        description=f"Found {len(results)} recipe(s)",
+        color=discord.Color.blue()
+    )
+    
+    for recipe in results[:10]:  # Limit to 10 results
+        recipe_id, name, _, servings = recipe
+        embed.add_field(
+            name=f"ID: {recipe_id} - {name}",
+            value=f"Servings: {servings}",
+            inline=False
+        )
+    
+    if len(results) > 10:
+        embed.set_footer(text=f"Showing first 10 of {len(results)} results")
+    
+    await ctx.send(embed=embed)
+
+@bot.command(name='recipe_view', help='View a recipe by ID. Usage: !recipe_view 1')
+async def view_recipe(ctx, recipe_id: int):
+    """View a specific recipe"""
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    
+    c.execute('SELECT * FROM recipes WHERE id = ?', (recipe_id,))
+    recipe = c.fetchone()
+    conn.close()
+    
+    if not recipe:
+        await ctx.send(f"Recipe with ID {recipe_id} not found.")
+        return
+    
+    # Parse recipe data
+    _, name, ingredients_json, instructions, servings, _, author_name = recipe
+    ingredients = json.loads(ingredients_json)
+    
+    # Create embed
+    embed = discord.Embed(
+        title=f"📖 {name}",
+        description=f"**Servings:** {servings}",
+        color=discord.Color.green()
+    )
+    
+    # Format ingredients
+    ing_text = ""
+    for ing in ingredients:
+        if ing['quantity'] > 0:
+            ing_text += f"• {ing['quantity']} {ing['unit']} {ing['item']}\n"
+        else:
+            ing_text += f"• {ing['item']}\n"
+    
+    embed.add_field(name="Ingredients", value=ing_text or "No ingredients", inline=False)
+    embed.add_field(name="Instructions", value=instructions[:1024], inline=False)
+    embed.set_footer(text=f"Added by {author_name}")
+    
+    await ctx.send(embed=embed)
+
+@bot.command(name='shopping_list', help='Generate shopping list from recipe IDs. Usage: !shopping_list 1 2 3')
+async def generate_shopping_list(ctx, *recipe_ids: int):
+    """Generate a shopping list from multiple recipes"""
+    if len(recipe_ids) < 1 or len(recipe_ids) > 7:
+        await ctx.send("Please provide between 1 and 7 recipe IDs.")
+        return
+    
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    
+    # Fetch all requested recipes
+    placeholders = ','.join('?' * len(recipe_ids))
+    c.execute(f'SELECT id, name, ingredients, instructions, servings FROM recipes WHERE id IN ({placeholders})', recipe_ids)
+    recipes = c.fetchall()
+    
+    if len(recipes) != len(recipe_ids):
+        await ctx.send("Some recipe IDs were not found.")
+        conn.close()
+        return
+    
+    # Combine ingredients
+    shopping_dict = combine_ingredients(recipes)
+    
+    # Create embed
+    embed = discord.Embed(
+        title="🛒 Shopping List",
+        description=f"Combined ingredients from {len(recipes)} recipes",
+        color=discord.Color.gold()
+    )
+    
+    # Add recipe names
+    recipe_names = [r[1] for r in recipes]
+    embed.add_field(name="Recipes", value="\n".join(f"• {name}" for name in recipe_names), inline=False)
+    
+    # Format shopping list
+    shopping_text = ""
+    for key, data in sorted(shopping_dict.items()):
+        if data['quantity'] > 0:
+            shopping_text += f"• {data['quantity']:.1f} {data['unit']} {data['item']}\n"
+        else:
+            shopping_text += f"• {data['item']}\n"
+    
+    # Split into multiple fields if too long
+    if len(shopping_text) > 1024:
+        chunks = [shopping_text[i:i+1024] for i in range(0, len(shopping_text), 1024)]
+        for i, chunk in enumerate(chunks[:3]):  # Max 3 fields
+            embed.add_field(
+                name=f"Shopping List {f'(Part {i+1})' if len(chunks) > 1 else ''}",
+                value=chunk,
+                inline=False
+            )
+    else:
+        embed.add_field(name="Shopping List", value=shopping_text, inline=False)
+    
+    # Save to database for future reference
+    c.execute('''INSERT INTO shopping_lists (user_id, recipes)
+                 VALUES (?, ?)''',
+              (ctx.author.id, json.dumps(list(recipe_ids))))
+    conn.commit()
+    conn.close()
+    
+    await ctx.send(embed=embed)
+    logger.info(f"Shopping list generated by {ctx.author} for recipes: {recipe_ids}")
+
+@bot.command(name='recipe_delete', help='Delete a recipe by ID. Usage: !recipe_delete 1')
+async def delete_recipe(ctx, recipe_id: int):
+    """Delete a recipe (only by the author or admin)"""
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    
+    # Check if recipe exists and get author
+    c.execute('SELECT author_id, name FROM recipes WHERE id = ?', (recipe_id,))
+    recipe = c.fetchone()
+    
+    if not recipe:
+        await ctx.send(f"Recipe with ID {recipe_id} not found.")
+        conn.close()
+        return
+    
+    author_id, recipe_name = recipe
+    
+    # Check permissions (author or admin)
+    if ctx.author.id != author_id and not ctx.author.guild_permissions.administrator:
+        await ctx.send("You can only delete your own recipes.")
+        conn.close()
+        return
+    
+    # Delete recipe
+    c.execute('DELETE FROM recipes WHERE id = ?', (recipe_id,))
+    conn.commit()
+    conn.close()
+    
+    await ctx.send(f"✅ Recipe '{recipe_name}' (ID: {recipe_id}) has been deleted.")
+    logger.info(f"Recipe '{recipe_name}' deleted by {ctx.author}")
+
+@bot.command(name='my_recipes', help='View all your recipes')
+async def my_recipes(ctx):
+    """List all recipes by the user"""
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    
+    c.execute('SELECT id, name, servings FROM recipes WHERE author_id = ?', (ctx.author.id,))
+    recipes = c.fetchall()
+    conn.close()
+    
+    if not recipes:
+        await ctx.send("You haven't added any recipes yet.")
+        return
+    
+    embed = discord.Embed(
+        title="👨‍🍳 Your Recipes",
+        description=f"You have {len(recipes)} recipe(s)",
+        color=discord.Color.purple()
+    )
+    
+    for recipe_id, name, servings in recipes[:25]:  # Discord embed field limit
+        embed.add_field(
+            name=f"ID: {recipe_id} - {name}",
+            value=f"Servings: {servings}",
+            inline=False
+        )
+    
+    if len(recipes) > 25:
+        embed.set_footer(text=f"Showing first 25 of {len(recipes)} recipes")
+    
+    await ctx.send(embed=embed)
+
+@bot.command(name='recipe_stats', help='View bot statistics')
+async def recipe_stats(ctx):
+    """Show statistics about the recipe database"""
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    
+    # Get total recipes
+    c.execute('SELECT COUNT(*) FROM recipes')
+    total_recipes = c.fetchone()[0]
+    
+    # Get total users
+    c.execute('SELECT COUNT(DISTINCT author_id) FROM recipes')
+    total_users = c.fetchone()[0]
+    
+    # Get most popular ingredients
+    c.execute('SELECT ingredients FROM recipes')
+    all_ingredients = c.fetchall()
+    
+    conn.close()
+    
+    # Count ingredient frequency
+    ingredient_count = {}
+    for (ingredients_json,) in all_ingredients:
+        ingredients = json.loads(ingredients_json)
+        for ing in ingredients:
+            item = ing['item'].lower()
+            ingredient_count[item] = ingredient_count.get(item, 0) + 1
+    
+    # Get top 5 ingredients
+    top_ingredients = sorted(ingredient_count.items(), key=lambda x: x[1], reverse=True)[:5]
+    
+    # Create embed
+    embed = discord.Embed(
+        title="📊 Recipe Bot Statistics",
+        color=discord.Color.blue()
+    )
+    
+    embed.add_field(name="Total Recipes", value=total_recipes, inline=True)
+    embed.add_field(name="Contributing Chefs", value=total_users, inline=True)
+    
+    if top_ingredients:
+        top_ing_text = "\n".join(f"• {item}: {count} recipes" for item, count in top_ingredients)
+        embed.add_field(name="Top Ingredients", value=top_ing_text, inline=False)
+    
+    await ctx.send(embed=embed)
+
+# Run the bot
+if __name__ == "__main__":
+    if not BOT_TOKEN:
+        logger.error("BOT_TOKEN environment variable is not set!")
+        sys.exit(1)
+    
+    logger.info("Starting Discord Recipe Bot...")
+    
+    try:
+        bot.run(BOT_TOKEN)
+    except discord.LoginFailure:
+        logger.error("Invalid bot token! Please check your BOT_TOKEN environment variable.")
+        sys.exit(1)
+    except Exception as e:
+        logger.error(f"An error occurred: {e}")
+        sys.exit(1)
